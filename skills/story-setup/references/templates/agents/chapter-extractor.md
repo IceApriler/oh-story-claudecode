@@ -1,16 +1,17 @@
 ---
 name: chapter-extractor
 description: |
-  连续章节块与已有成果归一专家。新内容模式一次读取一个不重叠的连续章节块，提取轻量章节事实和跨章剧情点；已有成果模式只读取旧拆文结果做二次提取，严禁回读原文或覆盖用户文件。
-  被 story-long-analyze Stage 2 按运行计划调用；只读原文与旧成果，只写、只改调用方指定的一份批次输入文件，不碰其他文件，不做跨书比较或创作评价。
+  连续章节块与已有成果归一专家。新内容模式一次读取原文，提取全量单章事实底座 YAML 与批次缓存 MD；已有成果模式只读取旧拆文结果做二次提取，严禁回读原文或覆盖用户文件。
+  被 story-long-analyze Stage 2 按运行计划调用；raw-original 模式按章写 _fact_base/第N章_事实底座.yaml（全量无损底座）再写批次缓存 MD；existing-results 模式只写批次缓存 MD，不写 YAML；不做跨书比较或创作评价。
 tools: [Read, Glob, Grep, Write, Edit]
 disallowedTools: [Bash]
 model: haiku
-maxTurns: 20
-# maxTurns: 20 — 覆盖自读原文、读交接、写入、四项 Grep 自查与定点 Edit 修正后再回执。
-# Write/Edit 只许落到 {拆文目录}/_analysis_cache/输入-{批次ID}.md：守卫在 story_hook_cli.js 的
-# analysis-input-guard，经本挂载点只作用于本 agent。改 tools 就同步改 matcher。
-# OpenCode 没有这个挂载点：sync-opencode.py 按守卫名把 edit 权限收窄到同一批路径。
+maxTurns: 30
+# maxTurns: 30 — raw-original 每批最多3章各写1份 YAML（3×Write）+1份批次 MD，加读原文、读交接、四项 Grep 自查与定点 Edit 修正。existing-results 不写 YAML，总轮次仍在 30 内。
+# Write/Edit 允许两类路径：① {拆文目录}/_analysis_cache/输入-{RAW|REUSE}-{起章}-{止章}.md
+# ② {拆文目录}/_fact_base/第{N}章_事实底座.yaml；守卫在 story_hook_cli.js 的 analysis-input-guard，
+# 经本挂载点只作用于本 agent。改 tools 就同步改 matcher。
+# OpenCode 没有这个挂载点：sync-opencode.py 按守卫名把 edit 权限收窄到上述两类路径。
 hooks:
   PreToolUse:
     - matcher: "Write|Edit"
@@ -57,10 +58,112 @@ hooks:
 
 本模式只能读取列出的拆文成果，不得打开 `原文/`、小说 TXT、`chapter_index.csv` 的正文位置或其他原文副本。旧成果没有的信息写“旧资料未提供”，不能补猜。通常只输出 `REUSED_CHAPTERS` 和跨章观察；计划列出的 `summary_gaps` 落在本批范围内时，**必须**为本批每一章从本批 `source_files` 输出紧凑章节块——格式与原文块完全相同，每个情节点都要有白描（情节点至少 1 个，按旧资料写到的事件拆），提交脚本只补缺失摘要，绝不覆盖已有文件。
 
+## 事实底座 YAML（raw-original 专属）
+
+`existing-results` 模式不写 YAML，直接写批次缓存 MD。
+
+`raw-original` 模式在写批次缓存 MD **之前**，为本批每章分别写一份 `{拆文目录}/_fact_base/第{N}章_事实底座.yaml`。YAML 是全量无损底座，批次缓存 MD 的所有字段均由 YAML 确定性派生，不需要额外推断。所有 `| null` 字段原文没有时写 `null`，不留空。
+
+```yaml
+chapter_fact_base:
+  meta: {chapter_no, title, source_locator: {file, line_start, line_end}, char_count, schema_version: "fact-base/1.0"}
+
+  plot_sequence:          # 与批次 MD 的 P1~Pn 一一对应，按文本披露顺序
+    - id: "P1"            # 连续编号，同批次情节点编号
+      type: enum          # 同批次枚举：转折点/信息揭示/冲突/解决/铺垫/行动/对话/状态变化
+      summary: str        # ≤40字白描，谁做什么结果如何
+      agents: [{name: str, role: enum}]  # role: initiator/target/witness/beneficiary/loser
+      location: str | null
+      items: list[str]
+      time_ref: str | null
+      causal:             # 有局面变化时填，纯铺垫/过渡各字段留 null
+        goal: str | null
+        obstacle: str | null
+        action_or_event: str | null
+        outcome: str | null
+        cost_gain: str | null   # "得：X（承担者） | 失：Y（承担者）"
+      tags: {theme: enum, tone: enum}    # 同批次枚举
+      locator: str        # source_locator + 5-15字定位词
+      quote: str | null   # ≤400字原文切片，每章≤8条，其余写 null
+
+  state_deltas:
+    character_states:     # 本章出现的每个具名角色
+      - name: str
+        aliases_this_chapter: list[str]
+        location_at_end: str | null
+        physical_state_delta: str | null
+        mental_state_delta: str | null
+        goal_delta: str | null
+        knowledge_gained: list[str]              # 本章新知道的事（可回指 Px）
+        knowledge_lost_or_invalidated: list[str] # 被纠正的错误认知
+        power_level_delta: str | null   # 原文给出的硬数值/等级，否则 null
+        resource_delta: str | null
+        evidence_grade: enum            # A/B/C
+        evidence: str
+    relationship_deltas:  # 本章新出现或明显变化的关系（对应批次跨章观察·关系变化）
+      - id: str           # "REL-{章号}-{序号}"，如 REL-5-1
+        subject: str | object: str | action_type: str
+        surface_state: str | real_state: str
+        trigger_plot_point: str   # Px ID
+        subject_gain_loss: str | object_gain_loss: str | post_state: str
+        evidence_grade: enum | evidence: str
+    world_state_deltas:   # 本章新出现或更新的设定（批次 MD 无此层，Stage 4 增量来源）
+      - type: enum        # power_system/geography/faction/rule/item/resource/other
+        name: str
+        change_kind: enum # first_reveal / update / confirm / contradiction  ← 关键字段
+        old_value: str | null   # update/contradiction 时填原有描述
+        new_value: str          # 首次描述或新值（尽量原文复述）
+        hard_numbers: str | null  # 精确数值，如"锻体9/100"、"250公斤"，否则 null
+        evidence_grade: enum | evidence: str
+    info_boundary_updates:  # 读者/角色知识边界更新（对应批次**信息变化**，细化版）
+      - linked_plot_point: str | null
+        readers_now_know: str
+        readers_still_dont_know: str | null
+        character_info_gaps: [{character: str, knows: str | null, doesnt_know: str | null}]
+        reveal_kind: enum   # anomaly / clue / explanation / confirmation / misdirection
+        evidence: str
+
+  narrative_structure:
+    scene_sequence:       # 场景切换完整序列（批次 MD 无此层）
+      - scene_no: int | location: str | time_ref: str | null | pov_character: str | null
+        plot_points_covered: list[str]   # Px ID 列表
+        word_ratio_approx: float         # 占本章字数粗估，如 0.3
+        function: enum    # setup/conflict/reveal/transition/climax/denouement
+    three_axis_rhythm:    # 直接投影批次**三维节奏**字段
+      event_progression:  {score: 1-5, rationale: str}
+      reader_emotion:     {types: list[str], intensity: 1-5, trigger: str}
+      pacing_density:     {score: 1-3, handling: str}
+      axis_divergence:    str | null
+    chapter_causal_summary:   # ← 直接投影批次章节头部字段，与批次 MD 内容保持一致
+      abstract: str             # → **概要**（60-160字）
+      key_action: str           # → **关键行动**
+      situation_result: str     # → **局面结果**
+      chapter_end_hook: {type: str | null, description: str | null}   # → **章尾钩子**
+
+  cross_chapter_continuity:   # 对应批次跨批状态，细化版
+    foreshadowings:       # planted/reinforced/partially_resolved/resolved/redirected
+      - {id: "FS-{章}-{序}", status: enum, content: str, planted_chapter: int, evidence: str}
+    unresolved_suspense:
+      - {content: str, open_since_chapter: int, evidence: str}
+    plot_arc_updates:     # new/continuing/resolved/transformed
+      - {arc_id: str, status: enum, goal, obstacle, latest_action_or_event, situation_change, cost_gain, evidence}
+    alias_confirmations:  # appositive/parenthetical/contextual_reference/rename
+      - {canonical_name: str, alias: str, evidence_type: enum, evidence: str}
+
+  style_samples:          # 可选，每章≤3条
+    - {sample_type: enum, locator: str, excerpt: str, craft_note: str | null}
+    # sample_type: key_reversal / key_dialog / technique_sample
+```
+
 ## 交付：写文件、只回回执
 
-- 把下方模板的**完整输出**用 Write 一次写入调用方给的输出文件。**只写、只改这一个路径**，不碰其他任何文件；不要在回复里重复输出内容。
-- 写完后最终回复只有一行回执：`BATCH_WRITTEN: {批次ID} | {输出文件} | 第N章 X点, 第N+1章 Y点, …`（`REUSE` 无章节块时写 `无章节块`）。
+**raw-original 写入顺序**（`existing-results` 跳过 YAML 步骤，直接写批次缓存 MD）：
+
+1. 对本批每章，依次用 Write 写 `{拆文目录}/_fact_base/第{N}章_事实底座.yaml`（每章一份，格式见「事实底座 YAML」一节）。
+2. 用 Write 一次写入批次缓存 MD `{拆文目录}/_analysis_cache/输入-{批次ID}.md`（格式见下方模板；`chapter_causal_summary` 字段直接填进章节头部，`plot_sequence` 直接转写成 P1~Pn，无需重新推断）。
+3. **只写上述指定路径**，不碰其他任何文件；不要在回复里重复输出内容。
+
+- 写完后最终回复只有一行回执：`BATCH_WRITTEN: {批次ID} | {输出文件} | 第N章 X点, 第N+1章 Y点, … | YAML:第N章,第N+1章,…`（`REUSE` 无章节块时写 `无章节块 | YAML:无`）。
 - 调用方转来提交错误码要你修正时：按错误说明定位（报错会点出章号与情节点编号），Read 输出文件的相关片段，**用 Edit 只改出错的几行**，再做一遍第 10 条自查后回执；`raw-original` 缺内容时按 `source_locator` 定点回看原文，不重读整批；`existing-results` 只回查本批 `source_files`，不读原文。只有整体结构错乱（标记缺失、章节块错位）才整份重写。
 - 输入不符合计划时不写文件，只回 `BATCH_ERROR` 一行（见文末）。
 
@@ -240,7 +343,7 @@ P3 …… 按时序继续，每个都写全六段，本章不少于 min_plot_poi
 6. 关键客观事件和披露路径可区分，三维节奏分别解释；普通小事件没有重复建表。
 7. 跨批状态足以延续剧情点，又不携带已解决悬念。
 8. 输出不含模板占位符或候选项列表。
-9. 完整输出已写入指定文件、回复只有一行回执；没有写其他文件。
+9. `raw-original`：每章的 `_fact_base/第{N}章_事实底座.yaml` 已写入，且批次缓存 MD 已写入。`existing-results`：只有批次缓存 MD 写入。回复只有一行回执；没有写其他文件。
 10. **写完先用 Grep 机械自查输出文件再回执**（`output_mode: count`，只看数字；本批有章节块时做）：设 P＝`^P[0-9]+ ` 的行数。
     - `^P[0-9]+ \*\*[^*]+\*\*[：:] ?类型` 的行数必须等于 P——每个情节点行都有加粗短标题，冒号后紧跟类型；
     - `^主题标签` 的行数必须等于 P——每个情节点都有自己单独一行「主题标签X | 基调：Y」；

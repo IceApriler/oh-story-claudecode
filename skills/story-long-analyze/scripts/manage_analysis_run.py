@@ -21,6 +21,12 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+try:
+    import yaml as _yaml  # PyYAML is optional; fact_base digest degrades gracefully without it
+    _YAML_OK = True
+except ImportError:
+    _YAML_OK = False
+
 from inspect_existing_assets import inspect
 
 
@@ -969,6 +975,112 @@ OBS_END = "<!-- BATCH_OBSERVATIONS_END -->"
 SUMMARY_FIELDS = ("概要", "关键事件", "因果", "局面结果", "涉及", "信息变化", "状态变化",
                   "三维节奏", "章尾钩子", "证据")
 
+# Fields available from _fact_base/第N章_事实底座.yaml (fact-base/1.0). When PyYAML
+# is missing, digest --source fact_base degrades to a graceful error. Paths use the
+# YAML key names (dot notation for nested fields), not the legacy MD labels.
+FACT_BASE_FIELDS = (
+    "meta", "plot_sequence", "state_deltas.character_states",
+    "state_deltas.relationship_deltas", "state_deltas.world_state_deltas",
+    "state_deltas.info_boundary_updates", "narrative_structure.scene_sequence",
+    "narrative_structure.three_axis_rhythm", "narrative_structure.chapter_causal_summary",
+    "cross_chapter_continuity.foreshadowings", "cross_chapter_continuity.unresolved_suspense",
+    "cross_chapter_continuity.plot_arc_updates", "cross_chapter_continuity.alias_confirmations",
+    "style_samples",
+)
+# Shorthand aliases that map to full YAML paths.
+FACT_BASE_ALIASES = {
+    "概要": "narrative_structure.chapter_causal_summary.abstract",
+    "关键行动": "narrative_structure.chapter_causal_summary.key_action",
+    "局面结果": "narrative_structure.chapter_causal_summary.situation_result",
+    "章尾钩子": "narrative_structure.chapter_causal_summary.chapter_end_hook",
+    "涉及人物": "state_deltas.character_states",
+    "信息变化": "state_deltas.info_boundary_updates",
+    "状态变化": "state_deltas.character_states",
+    "三维节奏": "narrative_structure.three_axis_rhythm",
+    "伏笔": "cross_chapter_continuity.foreshadowings",
+    "悬念": "cross_chapter_continuity.unresolved_suspense",
+    "剧情点": "cross_chapter_continuity.plot_arc_updates",
+    "别名": "cross_chapter_continuity.alias_confirmations",
+    "设定变化": "state_deltas.world_state_deltas",
+    "硬数值": "state_deltas.world_state_deltas",  # filtered to hard_numbers only
+    "写法样本": "style_samples",
+    "情节点": "plot_sequence",
+    "场景": "narrative_structure.scene_sequence",
+}
+
+
+def fact_base_path(root: Path, chapter: int) -> Path:
+    return root / "_fact_base" / ("第%d章_事实底座.yaml" % chapter)
+
+
+def digest_fact_base(root: Path, window: Optional[Tuple[int, int]],
+                     fields: List[str]) -> str:
+    if not _YAML_OK:
+        raise RunError("fact_base_no_yaml", "PyYAML not installed; pip install pyyaml to use --source fact_base")
+    available = sorted(
+        int(m.group(1)) for path in (root / "_fact_base").glob("第*章_事实底座.yaml")
+        for m in [re.fullmatch(r"第(\d+)章_事实底座", path.stem)] if m
+    )
+    if not available:
+        raise RunError("fact_base_empty", "no _fact_base/*.yaml files found; run raw-original extraction first")
+    parts = []  # type: List[str]
+    for chapter in available:
+        if window and not window[0] <= chapter <= window[1]:
+            continue
+        data = _yaml.safe_load(fact_base_path(root, chapter).read_text(encoding="utf-8-sig"))
+        if not isinstance(data, dict):
+            continue
+        cfb = data.get("chapter_fact_base", data)
+        lines = ["### 第%d章" % chapter]
+        for field in fields:
+            full = FACT_BASE_ALIASES.get(field, field)
+            value = _dig_nested(cfb, full)
+            if field == "硬数值":
+                value = _filter_hard_numbers(value)
+            lines.append("- %s：%s" % (field, _yaml_value_to_str(value)))
+        parts.append("\n".join(lines))
+    if not parts:
+        raise RunError("digest_nothing_found", "no fact_base files in range")
+    return "\n\n".join(parts) + "\n"
+
+
+def _dig_nested(obj: Any, dotted: str) -> Any:
+    cur = obj
+    for key in dotted.split("."):
+        if isinstance(cur, dict) and key in cur:
+            cur = cur[key]
+        elif isinstance(cur, list):
+            # Allow index access like "0" or key that means "first element"
+            if key.isdigit() and int(key) < len(cur):
+                cur = cur[int(key)]
+            else:
+                return None
+        else:
+            return None
+    return cur
+
+
+def _filter_hard_numbers(world_deltas: Any) -> Any:
+    if not isinstance(world_deltas, list):
+        return world_deltas
+    out = []
+    for item in world_deltas:
+        if isinstance(item, dict) and item.get("hard_numbers") not in (None, ""):
+            out.append({"name": item.get("name"), "hard_numbers": item.get("hard_numbers"),
+                        "change_kind": item.get("change_kind"), "evidence": item.get("evidence")})
+    return out
+
+
+def _yaml_value_to_str(value: Any) -> str:
+    if value is None:
+        return "未提供"
+    if isinstance(value, str):
+        return value
+    try:
+        return _yaml.safe_dump(value, allow_unicode=True, default_flow_style=False).strip()
+    except Exception:
+        return str(value)
+
 
 def parse_chapter_window(value: Optional[str]) -> Optional[Tuple[int, int]]:
     if not value:
@@ -1039,6 +1151,12 @@ def summary_points(text: str, mode: str) -> List[str]:
 def digest_command(args: argparse.Namespace) -> Dict[str, Any]:
     root = require_root(args.root)
     window = parse_chapter_window(args.chapters)
+    # --source fact_base: read from _fact_base/*.yaml instead of summaries/caches
+    if getattr(args, "source", None) == "fact_base":
+        fields = [item.strip() for item in (args.fields or "").split(",") if item.strip()]
+        if not fields:
+            raise RunError("digest_empty_request", "pass --fields when using --source fact_base")
+        return {"ok": True, "text": digest_fact_base(root, window, fields)}
     parts = []  # type: List[str]
     if args.part == "observations":
         for start, end, batch_id, path in digest_caches(root):
@@ -1116,9 +1234,13 @@ def build_parser() -> argparse.ArgumentParser:
     stage.set_defaults(handler=mark_stage_command)
     digest = sub.add_parser("digest", help="print Stage 3-5 reading material without whole-cache reads")
     digest.add_argument("--root", required=True, type=Path)
-    digest.add_argument("--part", required=True, choices=("observations", "chapters"))
+    digest.add_argument("--source", choices=("cache", "fact_base"), default="cache",
+                        help="cache (default) reads summaries/caches; fact_base reads _fact_base/*.yaml")
+    digest.add_argument("--part", choices=("observations", "chapters"),
+                        help="required when --source=cache; ignored when --source=fact_base")
     digest.add_argument("--chapters", help="chapter window such as 1-40")
-    digest.add_argument("--fields", help="comma-separated summary fields, e.g. 三维节奏,涉及,状态变化")
+    digest.add_argument("--fields", help="comma-separated field names; cache uses summary labels, "
+                                         "fact_base uses YAML keys or shorthand aliases")
     digest.add_argument("--points", choices=("none", "brief", "full"), default="none")
     digest.set_defaults(handler=digest_command)
     return parser

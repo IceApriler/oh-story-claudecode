@@ -193,6 +193,19 @@ if (command === "extract-target") {
   if (!target) process.exit(0)
   const root = path.resolve(process.env.CLAUDE_PROJECT_DIR || digString(obj, ["cwd"]) || process.cwd())
   const absolute = path.resolve(root, target)
+  // Fast-path：也允许写 {拆文目录}/_fact_base/第{N}章_事实底座.yaml
+  const factMatch = /^第(\d+)章_事实底座\.yaml$/.exec(path.basename(absolute))
+  if (factMatch) {
+    const factDir = path.dirname(absolute)
+    const bookDir0 = path.dirname(factDir)
+    const rel0 = path.relative(root, absolute)
+    if (
+      path.basename(factDir) === "_fact_base" &&
+      !rel0.startsWith("..") && !path.isAbsolute(rel0) &&
+      ["chapter_index.csv", "_progress.md"].some((n) => fs.existsSync(path.join(bookDir0, n)))
+    ) process.exit(0)
+    // 路径格式不合法时不走 fast-path，继续走下面的 _analysis_cache 检查（会被拒收并给出提示）
+  }
   const reasons = []
   const match = /^输入-(RAW|REUSE)-(\d+)-(\d+)\.md$/.exec(path.basename(absolute))
   if (!match) reasons.push("文件名必须是 输入-{RAW|REUSE}-{起章}-{止章}.md")
