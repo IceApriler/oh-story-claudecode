@@ -1,4 +1,3 @@
-\
 #!/usr/bin/env node
 /**
  * apply-fact-base-patch.js
